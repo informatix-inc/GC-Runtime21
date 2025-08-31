@@ -133,6 +133,7 @@ PerfCounter*    ClassLoader::_perf_define_appclass_selftime = nullptr;
 PerfCounter*    ClassLoader::_perf_app_classfile_bytes_read = nullptr;
 PerfCounter*    ClassLoader::_perf_sys_classfile_bytes_read = nullptr;
 PerfCounter*    ClassLoader::_unsafe_defineClassCallCounter = nullptr;
+PerfCounter*    ClassLoader::_perf_secondary_hash_time = nullptr;
 
 GrowableArray<ModuleClassPathList*>* ClassLoader::_patch_mod_entries = nullptr;
 GrowableArray<ModuleClassPathList*>* ClassLoader::_exploded_entries = nullptr;
@@ -520,7 +521,8 @@ void ClassLoader::setup_app_search_path(JavaThread* current, const char *class_p
 
   while (cp_stream.has_next()) {
     const char* path = cp_stream.get_next();
-    update_class_path_entry_list(current, path, false, false, false);
+    update_class_path_entry_list(current, path, /* check_for_duplicates */ true,
+                                 /* is_boot_append */ false, /* from_class_path_attr */ false);
   }
 }
 
@@ -665,7 +667,8 @@ void ClassLoader::setup_bootstrap_search_path_impl(JavaThread* current, const ch
     } else {
       // Every entry on the boot class path after the initial base piece,
       // which is set by os::set_boot_path(), is considered an appended entry.
-      update_class_path_entry_list(current, path, false, true, false);
+      update_class_path_entry_list(current, path, /* check_for_duplicates */ false,
+                                    /* is_boot_append */ true, /* from_class_path_attr */ false);
     }
   }
 }
@@ -800,7 +803,7 @@ void ClassLoader::add_to_boot_append_entries(ClassPathEntry *new_entry) {
 // Note that at dump time, ClassLoader::_app_classpath_entries are NOT used for
 // loading app classes. Instead, the app class are loaded by the
 // jdk/internal/loader/ClassLoaders$AppClassLoader instance.
-void ClassLoader::add_to_app_classpath_entries(JavaThread* current,
+bool ClassLoader::add_to_app_classpath_entries(JavaThread* current,
                                                ClassPathEntry* entry,
                                                bool check_for_duplicates) {
 #if INCLUDE_CDS
@@ -810,7 +813,7 @@ void ClassLoader::add_to_app_classpath_entries(JavaThread* current,
     while (e != nullptr) {
       if (strcmp(e->name(), entry->name()) == 0) {
         // entry already exists
-        return;
+        return false;
       }
       e = e->next();
     }
@@ -829,6 +832,7 @@ void ClassLoader::add_to_app_classpath_entries(JavaThread* current,
     ClassLoaderExt::process_jar_manifest(current, entry);
   }
 #endif
+  return true;
 }
 
 // Returns true IFF the file/dir exists and the entry was successfully created.
@@ -851,7 +855,10 @@ bool ClassLoader::update_class_path_entry_list(JavaThread* current,
     if (is_boot_append) {
       add_to_boot_append_entries(new_entry);
     } else {
-      add_to_app_classpath_entries(current, new_entry, check_for_duplicates);
+      if (!add_to_app_classpath_entries(current, new_entry, check_for_duplicates)) {
+        // new_entry is not saved, free it now
+        delete new_entry;
+      }
     }
     return true;
   } else {
@@ -1379,6 +1386,7 @@ void ClassLoader::initialize(TRAPS) {
     NEWPERFBYTECOUNTER(_perf_sys_classfile_bytes_read, SUN_CLS, "sysClassBytes");
 
     NEWPERFEVENTCOUNTER(_unsafe_defineClassCallCounter, SUN_CLS, "unsafeDefineClassCalls");
+    NEWPERFTICKCOUNTER(_perf_secondary_hash_time, SUN_CLS, "secondarySuperHashTime");
   }
 
   // lookup java library entry points

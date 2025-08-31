@@ -181,6 +181,9 @@ class ClassLoader: AllStatic {
 
   static PerfCounter* _unsafe_defineClassCallCounter;
 
+  // Count the time taken to hash the scondary superclass arrays.
+  static PerfCounter* _perf_secondary_hash_time;
+
   // The boot class path consists of 3 ordered pieces:
   //  1. the module/path pairs specified to --patch-module
   //    --patch-module=<module>=<file>(<pathsep><file>)*
@@ -221,7 +224,7 @@ class ClassLoader: AllStatic {
   CDS_ONLY(static ClassPathEntry* _last_module_path_entry;)
   CDS_ONLY(static void setup_app_search_path(JavaThread* current, const char* class_path);)
   CDS_ONLY(static void setup_module_search_path(JavaThread* current, const char* path);)
-  static void add_to_app_classpath_entries(JavaThread* current,
+  static bool add_to_app_classpath_entries(JavaThread* current,
                                            ClassPathEntry* entry,
                                            bool check_for_duplicates);
   CDS_ONLY(static void add_to_module_path_entries(const char* path,
@@ -289,6 +292,9 @@ class ClassLoader: AllStatic {
   static PerfCounter* perf_class_link_time()          { return _perf_class_link_time; }
   static PerfCounter* perf_class_link_selftime()      { return _perf_class_link_selftime; }
   static PerfCounter* perf_shared_classload_time()    { return _perf_shared_classload_time; }
+  static PerfCounter* perf_secondary_hash_time() {
+    return _perf_secondary_hash_time;
+  }
   static PerfCounter* perf_sys_classload_time()       { return _perf_sys_classload_time; }
   static PerfCounter* perf_app_classload_time()       { return _perf_app_classload_time; }
   static PerfCounter* perf_app_classload_selftime()   { return _perf_app_classload_selftime; }
