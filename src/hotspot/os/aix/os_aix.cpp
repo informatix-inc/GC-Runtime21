@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 1999, 2023, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2023 SAP SE. All rights reserved.
+ * Copyright (c) 2012, 2025 SAP SE. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -177,7 +177,7 @@ static void vmembk_print_on(outputStream* os);
 ////////////////////////////////////////////////////////////////////////////////
 // global variables (for a description see os_aix.hpp)
 
-julong    os::Aix::_physical_memory = 0;
+physical_memory_size_type    os::Aix::_physical_memory = 0;
 
 pthread_t os::Aix::_main_thread = ((pthread_t)0);
 
@@ -265,28 +265,29 @@ static bool is_close_to_brk(address a) {
   return false;
 }
 
-julong os::free_memory() {
-  return Aix::available_memory();
+bool os::free_memory(physical_memory_size_type& value) {
+  return Aix::available_memory(value);
 }
 
-julong os::available_memory() {
-  return Aix::available_memory();
+bool os::available_memory(physical_memory_size_type& value) {
+  return Aix::available_memory(value);
 }
 
-julong os::Aix::available_memory() {
+bool os::Aix::available_memory(physical_memory_size_type& value) {
   // Avoid expensive API call here, as returned value will always be null.
   if (os::Aix::on_pase()) {
     return 0x0LL;
   }
   os::Aix::meminfo_t mi;
   if (os::Aix::get_meminfo(&mi)) {
-    return mi.real_free;
+    value = static_cast<physical_memory_size_type>(mi.real_free);
+    return true;
   } else {
-    return ULONG_MAX;
+    return false;
   }
 }
 
-julong os::physical_memory() {
+physical_memory_size_type os::physical_memory() {
   return Aix::physical_memory();
 }
 
@@ -357,7 +358,7 @@ void os::Aix::initialize_system_info() {
   if (!os::Aix::get_meminfo(&mi)) {
     assert(false, "os::Aix::get_meminfo failed.");
   }
-  _physical_memory = (julong) mi.real_total;
+  _physical_memory = static_cast<physical_memory_size_type>(mi.real_total);
 }
 
 // Helper function for tracing page sizes.
@@ -1108,7 +1109,7 @@ bool os::dll_address_to_library_name(address addr, char* buf,
   return true;
 }
 
-static void* dll_load_library(const char *filename, char *ebuf, int ebuflen) {
+static void* dll_load_library(const char *filename, int *eno, char *ebuf, int ebuflen) {
 
   log_info(os)("attempting shared library load of %s", filename);
   if (ebuf && ebuflen > 0) {
@@ -1133,9 +1134,11 @@ static void* dll_load_library(const char *filename, char *ebuf, int ebuflen) {
     dflags |= RTLD_MEMBER;
   }
 
+  Events::log_dll_message(nullptr, "Attempting to load shared library %s", filename);
+
   void* result;
   const char* error_report = nullptr;
-  result = Aix_dlopen(filename, dflags, &error_report);
+  result = Aix_dlopen(filename, dflags, eno, &error_report);
   if (result != nullptr) {
     Events::log_dll_message(nullptr, "Loaded shared library %s", filename);
     // Reload dll cache. Don't do this in signal handling.
@@ -1160,20 +1163,24 @@ static void* dll_load_library(const char *filename, char *ebuf, int ebuflen) {
 // If filename matches <name>.so, and loading fails, repeat with <name>.a.
 void *os::dll_load(const char *filename, char *ebuf, int ebuflen) {
   void* result = nullptr;
-  char* const file_path = strdup(filename);
-  char* const pointer_to_dot = strrchr(file_path, '.');
   const char old_extension[] = ".so";
   const char new_extension[] = ".a";
-  STATIC_ASSERT(sizeof(old_extension) >= sizeof(new_extension));
   // First try to load the existing file.
-  result = dll_load_library(filename, ebuf, ebuflen);
-  // If the load fails,we try to reload by changing the extension to .a for .so files only.
+  int eno = 0;
+  result = dll_load_library(filename, &eno, ebuf, ebuflen);
+  // If the load fails, we try to reload by changing the extension to .a for .so files only.
   // Shared object in .so format dont have braces, hence they get removed for archives with members.
-  if (result == nullptr && pointer_to_dot != nullptr && strcmp(pointer_to_dot, old_extension) == 0) {
-    snprintf(pointer_to_dot, sizeof(old_extension), "%s", new_extension);
-    result = dll_load_library(file_path, ebuf, ebuflen);
+  if (result == nullptr && eno == ENOENT) {
+    const char* pointer_to_dot = strrchr(filename, '.');
+    if (pointer_to_dot != nullptr && strcmp(pointer_to_dot, old_extension) == 0) {
+      STATIC_ASSERT(sizeof(old_extension) >= sizeof(new_extension));
+      char* tmp_path = os::strdup(filename);
+      size_t prefix_size = pointer_delta(pointer_to_dot, filename, 1);
+      os::snprintf(tmp_path + prefix_size, sizeof(old_extension), "%s", new_extension);
+      result = dll_load_library(tmp_path, &eno, ebuf, ebuflen);
+      os::free(tmp_path);
+    }
   }
-  FREE_C_HEAP_ARRAY(char, file_path);
   return result;
 }
 
@@ -2398,7 +2405,7 @@ jint os::init_2(void) {
   }
 
   trcVerbose("processor count: %d", os::_processor_count);
-  trcVerbose("physical memory: %lu", Aix::_physical_memory);
+  trcVerbose("physical memory: " PHYS_MEM_TYPE_FORMAT, Aix::_physical_memory);
 
   // Initially build up the loaded dll map.
   LoadedLibraries::reload();
@@ -2702,7 +2709,7 @@ static bool thread_cpu_time_unchecked(Thread* thread, jlong* p_sys_time, jlong* 
                           dummy, &dummy_size) == 0) {
     tid = pinfo.__pi_tid;
   } else {
-    tty->print_cr("pthread_getthrds_np failed.");
+    tty->print_cr("pthread_getthrds_np failed, errno: %d.", errno);
     error = true;
   }
 
@@ -2713,7 +2720,7 @@ static bool thread_cpu_time_unchecked(Thread* thread, jlong* p_sys_time, jlong* 
       sys_time = thrdentry.ti_ru.ru_stime.tv_sec * 1000000000LL + thrdentry.ti_ru.ru_stime.tv_usec * 1000LL;
       user_time = thrdentry.ti_ru.ru_utime.tv_sec * 1000000000LL + thrdentry.ti_ru.ru_utime.tv_usec * 1000LL;
     } else {
-      tty->print_cr("pthread_getthrds_np failed.");
+      tty->print_cr("getthrds64 failed, errno: %d.", errno);
       error = true;
     }
   }

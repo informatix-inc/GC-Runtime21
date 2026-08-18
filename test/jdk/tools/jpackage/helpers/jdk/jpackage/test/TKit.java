@@ -23,7 +23,6 @@
 package jdk.jpackage.test;
 
 import java.io.Closeable;
-import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -37,10 +36,12 @@ import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
 import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
-import java.nio.file.WatchService;
 import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -107,11 +108,18 @@ final public class TKit {
             ThrowingRunnable.toRunnable(action).run();
         } else {
             try (PrintStream logStream = openLogStream()) {
-                extraLogStream = logStream;
-                ThrowingRunnable.toRunnable(action).run();
-            } finally {
-                extraLogStream = null;
+                withExtraLogStream(action, logStream);
             }
+        }
+    }
+
+    static void withExtraLogStream(ThrowingRunnable action, PrintStream logStream) {
+        var oldExtraLogStream = extraLogStream;
+        try {
+            extraLogStream = logStream;
+            ThrowingRunnable.toRunnable(action).run();
+        } finally {
+            extraLogStream = oldExtraLogStream;
         }
     }
 
@@ -187,11 +195,7 @@ final public class TKit {
     }
 
     public static boolean isLinuxAPT() {
-        if (!isLinux()) {
-            return false;
-        }
-        File aptFile = new File("/usr/bin/apt-get");
-        return aptFile.exists();
+        return isLinux() && Files.exists(Path.of("/usr/bin/apt-get"));
     }
 
     private static String addTimestamp(String msg) {
@@ -275,6 +279,22 @@ final public class TKit {
         throw new AssertionError(v);
     }
 
+    static void assertAssert(boolean expectedSuccess, Runnable runnable) {
+        try {
+            runnable.run();
+        } catch (AssertionError err) {
+            if (expectedSuccess) {
+                assertUnexpected("Assertion failed");
+            } else {
+                return;
+            }
+        }
+
+        if (!expectedSuccess) {
+            assertUnexpected("Assertion passed");
+        }
+    }
+
     private final static String TEMP_FILE_PREFIX = null;
 
     private static Path createUniqueFileName(String defaultName) {
@@ -298,7 +318,9 @@ final public class TKit {
             if (!path.toFile().exists()) {
                 return path;
             }
-            nameComponents[0] = String.format("%s.%d", baseName, i);
+            // Don't use period (.) as a separator. OSX codesign fails to sign folders
+            // with subfolders with names like "input.0".
+            nameComponents[0] = String.format("%s-%d", baseName, i);
         }
         throw new IllegalStateException(String.format(
                 "Failed to create unique file name from [%s] basename after %d attempts",
@@ -484,9 +506,9 @@ final public class TKit {
 
     public static RuntimeException throwSkippedException(String reason) {
         trace("Skip the test: " + reason);
-        RuntimeException ex = ThrowingSupplier.toSupplier(
-                () -> (RuntimeException) Class.forName("jtreg.SkippedException").getConstructor(
-                        String.class).newInstance(reason)).get();
+        RuntimeException ex = ThrowingSupplier.toSupplier(() -> {
+            return JtregSkippedExceptionClass.INSTANCE.getConstructor(String.class).newInstance(reason);
+        }).get();
 
         currentTest.notifySkipped(ex);
         throw ex;
@@ -511,49 +533,57 @@ final public class TKit {
         return file;
     }
 
-    static void waitForFileCreated(Path fileToWaitFor,
-            long timeoutSeconds) throws IOException {
+    public static void waitForFileCreated(Path fileToWaitFor,
+            Duration timeout, Duration afterCreatedTimeout) throws IOException {
+        waitForFileCreated(fileToWaitFor, timeout);
+        // Wait after the file has been created to ensure it is fully written.
+        ThrowingConsumer.<Duration>toConsumer(Thread::sleep).accept(afterCreatedTimeout);
+    }
+
+    private static void waitForFileCreated(Path fileToWaitFor, Duration timeout) throws IOException {
 
         trace(String.format("Wait for file [%s] to be available",
                                                 fileToWaitFor.toAbsolutePath()));
 
-        WatchService ws = FileSystems.getDefault().newWatchService();
+        try (var ws = FileSystems.getDefault().newWatchService()) {
 
-        Path watchDirectory = fileToWaitFor.toAbsolutePath().getParent();
-        watchDirectory.register(ws, ENTRY_CREATE, ENTRY_MODIFY);
+            Path watchDirectory = fileToWaitFor.toAbsolutePath().getParent();
+            watchDirectory.register(ws, ENTRY_CREATE, ENTRY_MODIFY);
 
-        long waitUntil = System.currentTimeMillis() + timeoutSeconds * 1000;
-        for (;;) {
-            long timeout = waitUntil - System.currentTimeMillis();
-            assertTrue(timeout > 0, String.format(
-                    "Check timeout value %d is positive", timeout));
+            var waitUntil = Instant.now().plus(timeout);
+            for (;;) {
+                Instant n = Instant.now();
+                Duration remainderTimeout = Duration.between(n, waitUntil);
+                assertTrue(remainderTimeout.isPositive(), String.format(
+                        "Check timeout value %dms is positive", remainderTimeout.toMillis()));
 
-            WatchKey key = ThrowingSupplier.toSupplier(() -> ws.poll(timeout,
-                    TimeUnit.MILLISECONDS)).get();
-            if (key == null) {
-                if (fileToWaitFor.toFile().exists()) {
-                    trace(String.format(
-                            "File [%s] is available after poll timeout expired",
-                            fileToWaitFor));
-                    return;
+                WatchKey key = ThrowingSupplier.toSupplier(() -> {
+                    return ws.poll(remainderTimeout.toMillis(), TimeUnit.MILLISECONDS);
+                }).get();
+                if (key == null) {
+                    if (Files.exists(fileToWaitFor)) {
+                        trace(String.format(
+                                "File [%s] is available after poll timeout expired",
+                                fileToWaitFor));
+                        return;
+                    }
+                    assertUnexpected(String.format("Timeout %dms expired", remainderTimeout.toMillis()));
                 }
-                assertUnexpected(String.format("Timeout expired", timeout));
-            }
 
-            for (WatchEvent<?> event : key.pollEvents()) {
-                if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
-                    continue;
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
+                        continue;
+                    }
+                    Path contextPath = (Path) event.context();
+                    if (Files.exists(fileToWaitFor) && Files.isSameFile(watchDirectory.resolve(contextPath), fileToWaitFor)) {
+                        trace(String.format("File [%s] is available", fileToWaitFor));
+                        return;
+                    }
                 }
-                Path contextPath = (Path) event.context();
-                if (Files.isSameFile(watchDirectory.resolve(contextPath),
-                        fileToWaitFor)) {
-                    trace(String.format("File [%s] is available", fileToWaitFor));
-                    return;
-                }
-            }
 
-            if (!key.reset()) {
-                assertUnexpected("Watch key invalidated");
+                if (!key.reset()) {
+                    assertUnexpected("Watch key invalidated");
+                }
             }
         }
     }
@@ -580,7 +610,7 @@ final public class TKit {
                     msg));
         }
 
-        traceAssert(String.format("assertEquals(%d): %s", expected, msg));
+        traceAssert(concatMessages(String.format("assertEquals(%d)", expected), msg));
     }
 
     public static void assertNotEquals(long expected, long actual, String msg) {
@@ -590,8 +620,8 @@ final public class TKit {
                     msg));
         }
 
-        traceAssert(String.format("assertNotEquals(%d, %d): %s", expected,
-                actual, msg));
+        traceAssert(concatMessages(String.format("assertNotEquals(%d, %d)", expected,
+                actual), msg));
     }
 
     public static void assertEquals(String expected, String actual, String msg) {
@@ -603,7 +633,7 @@ final public class TKit {
                     msg));
         }
 
-        traceAssert(String.format("assertEquals(%s): %s", expected, msg));
+        traceAssert(concatMessages(String.format("assertEquals(%s)", expected), msg));
     }
 
     public static void assertNotEquals(String expected, String actual, String msg) {
@@ -611,8 +641,8 @@ final public class TKit {
         if ((actual != null && !actual.equals(expected))
                 || (expected != null && !expected.equals(actual))) {
 
-            traceAssert(String.format("assertNotEquals(%s, %s): %s", expected,
-                actual, msg));
+            traceAssert(concatMessages(String.format("assertNotEquals(%s, %s)", expected,
+                actual), msg));
             return;
         }
 
@@ -626,7 +656,7 @@ final public class TKit {
                     value), msg));
         }
 
-        traceAssert(String.format("assertNull(): %s", msg));
+        traceAssert(concatMessages("assertNull()", msg));
     }
 
     public static void assertNotNull(Object value, String msg) {
@@ -635,7 +665,7 @@ final public class TKit {
             error(concatMessages("Unexpected null value", msg));
         }
 
-        traceAssert(String.format("assertNotNull(%s): %s", value, msg));
+        traceAssert(concatMessages(String.format("assertNotNull(%s)", value), msg));
     }
 
     public static void assertTrue(boolean actual, String msg) {
@@ -655,7 +685,7 @@ final public class TKit {
             error(concatMessages("Failed", msg));
         }
 
-        traceAssert(String.format("assertTrue(): %s", msg));
+        traceAssert(concatMessages("assertTrue()", msg));
     }
 
     public static void assertFalse(boolean actual, String msg, Runnable onFail) {
@@ -667,7 +697,7 @@ final public class TKit {
             error(concatMessages("Failed", msg));
         }
 
-        traceAssert(String.format("assertFalse(): %s", msg));
+        traceAssert(concatMessages("assertFalse()", msg));
     }
 
     public static void assertPathExists(Path path, boolean exists) {
@@ -826,7 +856,7 @@ final public class TKit {
             List<String> actual, String msg) {
         currentTest.notifyAssert();
 
-        traceAssert(String.format("assertStringListEquals(): %s", msg));
+        traceAssert(concatMessages("assertStringListEquals()", msg));
 
         String idxFieldFormat = Functional.identity(() -> {
             int listSize = expected.size();
@@ -856,7 +886,7 @@ final public class TKit {
                     expectedStr));
         });
 
-        if (expected.size() < actual.size()) {
+        if (actual.size() > expected.size()) {
             // Actual string list is longer than expected
             error(concatMessages(String.format(
                     "Actual list is longer than expected by %d elements",
@@ -866,7 +896,7 @@ final public class TKit {
         if (actual.size() < expected.size()) {
             // Actual string list is shorter than expected
             error(concatMessages(String.format(
-                    "Actual list is longer than expected by %d elements",
+                    "Actual list is shorter than expected by %d elements",
                     expected.size() - actual.size()), msg));
         }
     }
@@ -1044,5 +1074,30 @@ final public class TKit {
             VERBOSE_JPACKAGE = isNonOf.test(Set.of("jpackage", "jp"));
             VERBOSE_TEST_SETUP = isNonOf.test(Set.of("init", "i"));
         }
+    }
+
+    private static final class JtregSkippedExceptionClass extends ClassLoader {
+        @SuppressWarnings("unchecked")
+        JtregSkippedExceptionClass() {
+            super(TKit.class.getClassLoader());
+
+            final byte[] bytes = Base64.getDecoder().decode(
+                    // Base64-encoded "jtreg/SkippedException.class" file
+                    // emitted by jdk8's javac from "$OPEN_JDK/test/lib/jtreg/SkippedException.java"
+                    "yv66vgAAADQAFQoABAARCgAEABIHABMHABQBABBzZXJpYWxWZXJzaW9uVUlEAQABSgEADUNvbnN0"
+                    + "YW50VmFsdWUFErH6BHk+kr0BAAY8aW5pdD4BACooTGphdmEvbGFuZy9TdHJpbmc7TGphdmEvbGFu"
+                    + "Zy9UaHJvd2FibGU7KVYBAARDb2RlAQAPTGluZU51bWJlclRhYmxlAQAVKExqYXZhL2xhbmcvU3Ry"
+                    + "aW5nOylWAQAKU291cmNlRmlsZQEAFVNraXBwZWRFeGNlcHRpb24uamF2YQwACgALDAAKAA4BABZq"
+                    + "dHJlZy9Ta2lwcGVkRXhjZXB0aW9uAQAaamF2YS9sYW5nL1J1bnRpbWVFeGNlcHRpb24AMQADAAQA"
+                    + "AAABABoABQAGAAEABwAAAAIACAACAAEACgALAAEADAAAACMAAwADAAAAByorLLcAAbEAAAABAA0A"
+                    + "AAAKAAIAAAAiAAYAIwABAAoADgABAAwAAAAiAAIAAgAAAAYqK7cAArEAAAABAA0AAAAKAAIAAAAm"
+                    + "AAUAJwABAA8AAAACABA");
+
+            clazz = (Class<RuntimeException>)defineClass("jtreg.SkippedException", bytes, 0, bytes.length);
+        }
+
+        private final Class<RuntimeException> clazz;
+
+        static final Class<RuntimeException> INSTANCE = new JtregSkippedExceptionClass().clazz;
     }
 }

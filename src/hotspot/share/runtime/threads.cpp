@@ -63,6 +63,7 @@
 #include "runtime/flags/jvmFlagLimit.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/globals.hpp"
+#include "runtime/globals_extension.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/java.hpp"
 #include "runtime/javaCalls.hpp"
@@ -408,6 +409,19 @@ void Threads::initialize_jsr292_core_classes(TRAPS) {
   initialize_class(vmSymbols::java_lang_invoke_MethodHandleNatives(), CHECK);
 }
 
+// One-shot PeriodicTask subclass for reading the release file
+class ReadReleaseFileTask : public PeriodicTask {
+ public:
+  ReadReleaseFileTask() : PeriodicTask(100) {}
+
+  virtual void task() {
+    os::read_image_release_file();
+
+    // Reclaim our storage and disenroll ourself.
+    delete this;
+  }
+};
+
 jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   extern void JDK_Version_init();
 
@@ -555,6 +569,10 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
     return status;
   }
 
+  // Have the WatcherThread read the release file in the background.
+  ReadReleaseFileTask* read_task = new ReadReleaseFileTask();
+  read_task->enroll();
+
   // Create WatcherThread as soon as we can since we need it in case
   // of hangs during error reporting.
   WatcherThread::start();
@@ -664,6 +682,11 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
 #endif // INCLUDE_MANAGEMENT
 
   log_info(os)("Initialized VM with process ID %d", os::current_process_id());
+
+  if (!FLAG_IS_DEFAULT(CreateCoredumpOnCrash) && CreateCoredumpOnCrash) {
+    char buffer[2*JVM_MAXPATHLEN];
+    os::check_core_dump_prerequisites(buffer, sizeof(buffer), true);
+  }
 
   // Signal Dispatcher needs to be started before VMInit event is posted
   os::initialize_jdk_signal_support(CHECK_JNI_ERR);
@@ -1017,9 +1040,11 @@ void Threads::add(JavaThread* p, bool force_daemon) {
 void Threads::remove(JavaThread* p, bool is_daemon) {
   // Extra scope needed for Thread_lock, so we can check
   // that we do not remove thread without safepoint code notice
-  { MonitorLocker ml(Threads_lock);
+  {
+    MutexLocker throttle_ml(UseThreadsLockThrottleLock ? ThreadsLockThrottle_lock : nullptr);
+    MonitorLocker ml(Threads_lock);
 
-    if (ThreadIdTable::is_initialized()) {
+    if (ThreadIdTable::is_initialized_acquire()) {
       // This cleanup must be done before the current thread's GC barrier
       // is detached since we need to touch the threadObj oop.
       jlong tid = SharedRuntime::get_java_tid(p);
@@ -1065,7 +1090,7 @@ void Threads::remove(JavaThread* p, bool is_daemon) {
 
     // Notify threads waiting in EscapeBarriers
     EscapeBarrier::thread_removed(p);
-  } // unlock Threads_lock
+  } // unlock Threads_lock and ThreadsLockThrottle_lock
 
   // Reduce the ObjectMonitor ceiling for the exiting thread.
   ObjectSynchronizer::dec_in_use_list_ceiling();

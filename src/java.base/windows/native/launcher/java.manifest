@@ -38,7 +38,7 @@
   <asmv3:application>
     <asmv3:windowsSettings xmlns:dpi1="http://schemas.microsoft.com/SMI/2005/WindowsSettings"
                            xmlns:dpi2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
-      <dpi1:dpiAware>false</dpi1:dpiAware>
+      <dpi1:dpiAware>false/PM</dpi1:dpiAware>
       <dpi2:dpiAwareness>unaware</dpi2:dpiAwareness>
     </asmv3:windowsSettings>
   </asmv3:application>

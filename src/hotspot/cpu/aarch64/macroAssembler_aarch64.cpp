@@ -2425,6 +2425,17 @@ void MacroAssembler::store_sized_value(Address dst, Register src, size_t size_in
   }
 }
 
+void MacroAssembler::narrow_subword_type(Register reg, BasicType bt) {
+  assert(is_subword_type(bt), "required");
+  switch (bt) {
+  case T_BOOLEAN: andw(reg, reg, 1); break;
+  case T_BYTE:    sxtbw(reg, reg); break;
+  case T_CHAR:    uxthw(reg, reg); break;
+  case T_SHORT:   sxthw(reg, reg); break;
+  default:        ShouldNotReachHere();
+  }
+}
+
 void MacroAssembler::decrementw(Register reg, int value)
 {
   if (value < 0)  { incrementw(reg, -value);      return; }
@@ -2894,7 +2905,7 @@ void MacroAssembler::wrap_add_sub_imm_insn(Register Rd, Register Rn, uint64_t im
   if (fits) {
     (this->*insn1)(Rd, Rn, imm);
   } else {
-    if (uabs(imm) < (1 << 24)) {
+    if (g_uabs(imm) < (1 << 24)) {
        (this->*insn1)(Rd, Rn, imm & -(1 << 12));
        (this->*insn1)(Rd, Rd, imm & ((1 << 12)-1));
     } else {
@@ -5913,7 +5924,7 @@ void MacroAssembler::fill_words(Register base, Register cnt, Register value)
 // - sun/nio/cs/ISO_8859_1$Encoder.implEncodeISOArray
 //     return the number of characters copied.
 // - java/lang/StringUTF16.compress
-//     return zero (0) if copy fails, otherwise 'len'.
+//     return index of non-latin1 character if copy fails, otherwise 'len'.
 //
 // This version always returns the number of characters copied, and does not
 // clobber the 'len' register. A successful copy will complete with the post-
@@ -6130,15 +6141,15 @@ address MacroAssembler::byte_array_inflate(Register src, Register dst, Register 
 }
 
 // Compress char[] array to byte[].
+// Intrinsic for java.lang.StringUTF16.compress(char[] src, int srcOff, byte[] dst, int dstOff, int len)
+// Return the array length if every element in array can be encoded,
+// otherwise, the index of first non-latin1 (> 0xff) character.
 void MacroAssembler::char_array_compress(Register src, Register dst, Register len,
                                          Register res,
                                          FloatRegister tmp0, FloatRegister tmp1,
                                          FloatRegister tmp2, FloatRegister tmp3,
                                          FloatRegister tmp4, FloatRegister tmp5) {
   encode_iso_array(src, dst, len, res, false, tmp0, tmp1, tmp2, tmp3, tmp4, tmp5);
-  // Adjust result: res == len ? len : 0
-  cmp(len, res);
-  csel(res, res, zr, EQ);
 }
 
 // java.math.round(double a)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2003, 2024, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2017, 2020 SAP SE. All rights reserved.
  * Copyright (c) 2023, Red Hat, Inc. and/or its affiliates.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
@@ -107,12 +107,13 @@ const intptr_t    VMError::segfault_address = pd_segfault_address;
 static const char* env_list[] = {
   // All platforms
   "JAVA_HOME", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "CLASSPATH",
-  "PATH", "USERNAME",
+  "JDK_AOT_VM_OPTIONS",
+  "JAVA_OPTS", "PATH", "USERNAME",
 
   "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "FC_LANG", "FONTCONFIG_USE_MMAP",
 
   // Env variables that are defined on Linux/BSD
-  "LD_LIBRARY_PATH", "LD_PRELOAD", "SHELL", "DISPLAY",
+  "LD_LIBRARY_PATH", "LD_PRELOAD", "SHELL", "DISPLAY", "WAYLAND_DISPLAY",
   "HOSTTYPE", "OSTYPE", "ARCH", "MACHTYPE",
   "LANG", "LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME",
   "TERM", "TMPDIR", "TZ",
@@ -483,6 +484,10 @@ void VMError::print_native_stack(outputStream* st, frame fr, Thread* t, bool pri
 static void print_oom_reasons(outputStream* st) {
   st->print_cr("# Possible reasons:");
   st->print_cr("#   The system is out of physical RAM or swap space");
+#ifdef LINUX
+  st->print_cr("#   This process has exceeded the maximum number of memory mappings (check below");
+  st->print_cr("#     for `/proc/sys/vm/max_map_count` and `Total number of mappings`)");
+#endif
   if (UseCompressedOops) {
     st->print_cr("#   This process is running with CompressedOops enabled, and the Java Heap may be blocking the growth of the native heap");
   }
@@ -1291,6 +1296,10 @@ void VMError::report(outputStream* st, bool _verbose) {
     LogConfiguration::describe_current_configuration(st);
     st->cr();
 
+  STEP_IF("printing release file content", _verbose)
+    st->print_cr("Release file:");
+    os::print_image_release_file(st);
+
   STEP_IF("printing all environment variables", _verbose)
     os::print_environment_variables(st, env_list);
     st->cr();
@@ -1465,6 +1474,10 @@ void VMError::print_vm_info(outputStream* st) {
   st->print_cr("Logging:");
   LogConfiguration::describe(st);
   st->cr();
+
+  // STEP("printing release file content")
+  st->print_cr("Release file:");
+  os::print_image_release_file(st);
 
   // STEP("printing all environment variables")
 
@@ -1691,7 +1704,7 @@ void VMError::report_and_die(int id, const char* message, const char* detail_fmt
       ShowMessageBoxOnError = false;
     }
 
-    os::check_dump_limit(buffer, sizeof(buffer));
+    os::check_core_dump_prerequisites(buffer, sizeof(buffer));
 
     // reset signal handlers or exception filter; make sure recursive crashes
     // are handled properly.
